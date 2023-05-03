@@ -143,35 +143,40 @@ unsigned long djb2Hash(unsigned char* str)
 */
 HMODULE getModHandle(WCHAR* ModuleName)
 {
-    //PPEB pPeb = getTeb()->ProcessEnvironmentBlock; // get the TEB
-    PPEB pPeb = (PPEB)__readgsqword(0x60);
+    /* Input validation */
+    if (!ModuleName)
+        return -20;
+
+    PPEB pPeb = getTeb()->ProcessEnvironmentBlock; // get the TEB
+    //PPEB pPeb = (PPEB)__readgsqword(0x60); // get the PEB
     PPEB_LDR_DATA PebLdrData = { 0 };
     PLDR_DATA_TABLE_ENTRY LdrDataTableEntry = { 0 };
-    PLIST_ENTRY ModuleList = { 0 }, ForwardLink = { 0 };
+    PLIST_ENTRY ModuleList = { 0 }; // to store InMemoryOrderModuleList
+    PLIST_ENTRY ForwardLink = { 0 }; // to store the Flink
 
     if (pPeb)
     {
-        PebLdrData = pPeb->Ldr;
+        PebLdrData = pPeb->Ldr; // get the Ldr data from the _PEB
 
         if (PebLdrData)
         {
-            //ModuleList = &PebLdrData->InLoadOrderModuleList;
-            ModuleList = &PebLdrData->InMemoryOrderModuleList;
+            ModuleList = &PebLdrData->InMemoryOrderModuleList; // get the InMemoryOrderModuleList 
             ForwardLink = ModuleList->Flink;
 
             while (ModuleList != ForwardLink)
             {
+                /* Use the CONTAINING_RECORD macro to grab the LDR_DATA_TABLE_ENTRY from the current PLIST_ENTRY */
                 LdrDataTableEntry = CONTAINING_RECORD(ForwardLink-1, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
                 if (LdrDataTableEntry)
                 {
                     if (LdrDataTableEntry->BaseDllName.Buffer)
                     {
-                        //if (!cmpstr(LdrDataTableEntry->BaseDllName.Buffer, ModuleName))
+                        /* Use string hashing to check if the Dll entry matches the one we're looking for */
                         if (djb2Hash(LdrDataTableEntry->BaseDllName.Buffer) == djb2Hash(ModuleName))
-                            return (HMODULE)LdrDataTableEntry->BaseAddress;
+                            return (HMODULE)LdrDataTableEntry->BaseAddress; // return the address of the DLL we found
                     }
                 }
-                ForwardLink = ForwardLink->Flink;
+                ForwardLink = ForwardLink->Flink; // move down the list
             }
         }
     }
@@ -179,46 +184,44 @@ HMODULE getModHandle(WCHAR* ModuleName)
     return 0;
 }
 
+/*
+    Rewrite of the GetProcAddress() function
+*/
 FARPROC getProcAddr(HMODULE module, LPCSTR lpName)
 {
+    /* Input validation */
     if (!module || !lpName)
         return -1;
 
-    IMAGE_DOS_HEADER* dosHdr = (IMAGE_DOS_HEADER*)module; // this is the header of the module, in this case the dll
+    /* Get the DOS Header and make sure it is g2g ('MZ') */
+    IMAGE_DOS_HEADER* dosHdr = (IMAGE_DOS_HEADER*)module;
     if (dosHdr->e_magic != IMAGE_DOS_SIGNATURE)
         return -2;
 
-    IMAGE_NT_HEADERS* ntHdrs = (IMAGE_NT_HEADERS*)((BYTE*)module + dosHdr->e_lfanew);
+    /* Get the NT header and make sure it is g2g */
+    IMAGE_NT_HEADERS* ntHdrs = (IMAGE_NT_HEADERS*)((BYTE*)module + dosHdr->e_lfanew); 
     if (ntHdrs->Signature != IMAGE_NT_SIGNATURE)
         return -3;
 
+    /* Get the export directory of the dll and do some arithmetic to get the important tables (name, ordinal, function) */
     IMAGE_EXPORT_DIRECTORY* exportDir = (IMAGE_EXPORT_DIRECTORY*)((BYTE*)module + ntHdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
     DWORD* nameTable = (DWORD*)((BYTE*)module + exportDir->AddressOfNames);
     WORD* ordinalTable = (WORD*)((BYTE*)module + exportDir->AddressOfNameOrdinals);
     DWORD* funcTable = (DWORD*)((BYTE*)module + exportDir->AddressOfFunctions);
     DWORD i;
 
-    if (lpName)
+
+    /* Iterate through the exports and check to see if any of them match the one we're looking for */
+    for (i = 0; i < exportDir->NumberOfNames; i++)
     {
-        for (i = 0; i < exportDir->NumberOfNames; i++)
+        LPCSTR name = (LPCSTR)((BYTE*)module + nameTable[i]);
+        if (djb2Hash(name) == djb2Hash(lpName))
         {
-            LPCSTR name = (LPCSTR)((BYTE*)module + nameTable[i]);
-            //if (!cmpstr(name, lpName))
-            if (djb2Hash(name) == djb2Hash(lpName))
-            {
-                WORD ordinal = ordinalTable[i];
-                DWORD rva = funcTable[ordinal];
-                FARPROC ptr = (FARPROC)((BYTE*)module + rva);
-                return ptr;
-            }
+            WORD ordinal = ordinalTable[i];
+            DWORD rva = funcTable[ordinal];
+            FARPROC ptr = (FARPROC)((BYTE*)module + rva);
+            return ptr;
         }
-    }
-    else
-    {
-        WORD ord = LOWORD(lpName);
-        DWORD rva = funcTable[ord];
-        FARPROC ptr = (FARPROC)((BYTE*)module + rva);
-        return ptr;
     }
     
     return NULL; // ((void*)0); NULL
@@ -240,8 +243,9 @@ int importer()
 {
 	// kernel32.dll is loaded by default, so I don't think we need to import anything...
 	 HMODULE kernelHandle, dll;
-     FARPROC print, loader;
-     typedef HMODULE(WINAPI* LoadLibraryFunc)(LPCSTR); // function pointer for the LoadLibraryW function
+     FARPROC print, freeLib, loader;
+     typedef HMODULE(WINAPI* LoadLibraryFunc)(LPCSTR); // function pointer typedef for the LoadLibraryW function
+     typedef BOOL(WINAPI* FreeLibraryFunc)(HMODULE); // function pointer typedef for the FreeLibrary function
 
      /* Get handle to kernel32.dll */
      kernelHandle = getModHandle(L"kernel32.dll");
@@ -253,13 +257,21 @@ int importer()
      if (!loader)
              return -11;
 
-     /* Cast the function pointer from loader to the function pointer typedefe */
+     /* Get address of FreeLibrary fuction */
+     freeLib = getProcAddr(kernelHandle, "FreeLibrary");
+     if (!freeLib)
+         return -12;
+
+     /* Cast the function pointer from loader to the function pointer typedef */
      LoadLibraryFunc loadLibrary = (LoadLibraryFunc)loader;
+
+     /* Cast the function pointer from freeLib to the function pointer typedef */
+     FreeLibraryFunc freeLibrary = (FreeLibraryFunc)freeLib;
 
      /* Load the dll with printf in it */
      dll = loadLibrary(L"msvcrt.dll");
      if (!dll)
-         return -12;
+         return -13;
 
      /* Get handle to printf */
      print = getProcAddr(dll, "printf");
@@ -268,6 +280,9 @@ int importer()
 
      /* Call print */
      print("Hello world.\n");
+
+     /* Unload the dll */
+     freeLibrary(dll);
 
      return 0;
 }
